@@ -1,7 +1,7 @@
 #include "util.h"
 #include "uvpq.h"
 #include <string.h>
-
+#include <stdlib.h>
 
 
 typedef struct queue_s {
@@ -28,7 +28,7 @@ typedef struct uvpq_connection {
   uvpq_connection* next;
   queue_t * pending;
   uvpq_request *live;
-
+  uv_timer_t reconnect_timer;
 } uvpq_connection;
 
 typedef struct uvpq_pool {
@@ -38,15 +38,103 @@ typedef struct uvpq_pool {
 } uvpq_pool;
 
 
+void uvpq_connection_await(uvpq_connection *conn){
+    while (conn->pending->head || conn->live)
+      if (!uv_run(conn->loop, UV_RUN_ONCE))
+        break;
+}
+
+static void update_poll_eventmask(uvpq_connection* conn, int eventmask);
 
 uvpq_request * uvpq_requests_pop(struct queue_s * rqs);
 void poll_cb(uv_poll_t* handle, int status, int events);
 
+void connection_cb(uv_poll_t* handle, int status, int events){
+      if(status < 0)
+        failwith("unexpected status %d\n", status);
+    if((events & ~(UV_READABLE | UV_WRITABLE)) != 0)
+        failwith("received unexpcted event: %d\n", events);
+    uvpq_connection *conn = handle->data;
+    update_poll_eventmask( conn ,conn->eventmask);
+
+
+};
+
+
+static void reconnect_timer_cb(uv_timer_t* handle)
+{
+    uvpq_connection *conn = handle->data;
+
+    switch(conn->state) {
+    case UP_BAD_RESET:
+        if(0 != PQresetStart(conn->conn))
+            failwith("PQresetStart failed");
+        conn->state = UP_RESETTING;
+        update_poll_eventmask(conn, UV_WRITABLE | UV_READABLE);
+        break;
+    case UP_BAD_CONNECTION:
+        failwith("not impltmtnted: %d\n", conn->state);
+        break;
+    default:
+        failwith("unexpected state: %d\n", conn->state);
+    }
+}
+
 
 static void update_poll_eventmask(uvpq_connection* conn, int eventmask)
 {
+    uv_poll_cb cb= poll_cb;
+    int r = 0;
+    switch(conn->state) {
+    case UP_CONNECTING:
+        r = PQconnectPoll(conn->conn);
+        break;
+    case UP_RESETTING:
+        r = PQresetPoll(conn->conn);
+        break;
+    default:
+        ;
+    }
+    if (r)
+    switch(r) {
+      case PGRES_POLLING_READING:
+          eventmask = UV_READABLE;
+          cb = connection_cb;
+          break;
+      case PGRES_POLLING_WRITING:
+          eventmask = UV_WRITABLE;
+          cb = connection_cb;
+          break;
+      case PGRES_POLLING_OK:
+          conn->state = UP_CONNECTED;
+          eventmask = UV_WRITABLE | UV_READABLE;
+          cb = poll_cb;
+          break;
+      case PGRES_POLLING_FAILED:
+          switch(conn->state) {
+          case UP_CONNECTING:
+              conn->state = UP_BAD_CONNECTION;
+              break;
+          case UP_RESETTING:
+              conn->state = UP_BAD_RESET;
+              break;
+          default:
+              failwith("unexpected state: %d\n", conn->state);
+          }
+          r = uv_timer_start(
+            &conn->reconnect_timer,
+            reconnect_timer_cb,
+            1000,
+            0);
+          if (r != 0)
+              failwith("uv_timer_start: %s\n", uv_strerror(r));
+
+    }
+
+
+
     if(conn->eventmask != eventmask) {
-        int r = uv_poll_start(&conn->poll, eventmask, poll_cb);
+        int r = uv_poll_start(&conn->poll, eventmask, cb);
         if(r != 0)
             failwith("uv_poll_start: %s\n", uv_strerror(r));
         conn->eventmask = eventmask;
@@ -72,11 +160,10 @@ void uvpq_pool_put(uvpq_pool * pool, uvpq_connection * conn)
 
 
 void uvpq_PQsendQueryParams(uvpq_connection *conn){
-        uvpq_request *rq = uvpq_requests_pop(conn->pending);
-        conn->live = rq;
+        uvpq_request *rq = conn->pending->head;
         if (rq) {
 
-        if(!PQsendQueryParams(
+          if(!PQsendQueryParams(
                             conn->conn,
                             rq->command,
                             rq->nParams,
@@ -86,17 +173,20 @@ void uvpq_PQsendQueryParams(uvpq_connection *conn){
                             rq->paramFormats,
                             1))
             failwith("PQsendQuery: %s\n", PQerrorMessage(conn->conn));
+
+          conn->live = uvpq_requests_pop(conn->pending);
         }
+
 }
 
 void free_req(uvpq_request* req){
   free(req);
 }
 
+
+
 void poll_cb(uv_poll_t* handle, int status, int events) {
 
-    if(status < 0)
-        failwith("unexpected status %d\n", status);
 
     int r;
     uvpq_connection *conn = handle->data;
@@ -109,10 +199,10 @@ void poll_cb(uv_poll_t* handle, int status, int events) {
         eventmask &= ~UV_WRITABLE;
       }
       if (r == 0 && conn->live == NULL) {
-        if (!PQisBusy(conn->conn)) {
+        if (!PQisBusy(conn->conn))
           uvpq_PQsendQueryParams(conn);
-        }
-          PQflush(conn->conn);
+
+        PQflush(conn->conn);
           //printf("write %d\n", eventmask);
       }
     }
@@ -135,6 +225,8 @@ void poll_cb(uv_poll_t* handle, int status, int events) {
          eventmask |= UV_WRITABLE;
 
     }
+
+
     update_poll_eventmask(conn, eventmask);
 }
 
@@ -144,7 +236,7 @@ void uvpq_connect(uvpq_pool * pool, uvpq_connection* conn, char* uri) {
   conn->live = NULL;
   conn->next = NULL;
 
-  conn->conn = PQconnectdb(uri);
+  conn->conn = PQconnectStart(uri);
   if(conn->conn == NULL)
     failwith("PQconnectdb failed");
   if(PQstatus(conn->conn) == CONNECTION_BAD)
@@ -163,12 +255,15 @@ void uvpq_connect(uvpq_pool * pool, uvpq_connection* conn, char* uri) {
   if((r = uv_poll_init(pool->loop, &conn->poll, conn->fd)) != 0)
         failwith("uv_poll_init: %s\n", uv_strerror(r));
 
+  conn->reconnect_timer.data = conn;
+
+  if((r = uv_timer_init(pool->loop, &conn->reconnect_timer)) != 0)
+        failwith("uv_timer_init: %s\n", uv_strerror(r));
+
   conn->poll.data = conn;
 
-
-  conn->state = UP_CONNECTED;
   uvpq_pool_put(pool, conn);
-  update_poll_eventmask(conn, UV_READABLE);
+  update_poll_eventmask(conn, UV_READABLE|UV_WRITABLE);
 
 }
 

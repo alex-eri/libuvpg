@@ -1,6 +1,6 @@
 #include <uv.h>
 #include <libpq-fe.h>
-#include <stdlib.h>
+
 
 #define MAX_CONNINFO_LENGTH 1048
 
@@ -31,6 +31,7 @@ typedef struct uvpq_request uvpq_request;
 uvpq_pool * uvpq_pool_create( uv_loop_t *loop, int size, char* uri);
 uvpq_connection * uvpq_pool_acquire(uvpq_pool * pool);
 
+void uvpq_connection_await(uvpq_connection *conn);
 
 void uvpq_connection_query(uvpq_connection * conn,
                     const char *command,

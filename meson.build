@@ -1,4 +1,4 @@
-project('libuvpq', 'c')
+#project('libuvpq', 'c')
 
 libuvpq_deps = [
   dependency('libuv'),
